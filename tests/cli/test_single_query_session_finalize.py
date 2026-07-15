@@ -4,6 +4,10 @@ import pytest
 
 import cli
 
+import agent.auxiliary_client
+import tools.async_delegation
+import tools.mcp_tool
+
 
 @pytest.fixture(autouse=True)
 def reset_single_query_finalize_state(monkeypatch):
@@ -124,6 +128,102 @@ def test_finalize_single_query_signal_window_does_not_reemit_during_atexit(monke
     assert calls == [expected_finalize, ("release", {})]
 
 
+def test_finalize_single_query_closes_session_db_before_releasing_lease(monkeypatch):
+    """Regression: one-shot exit must call end_session() before releasing the
+    active-session lease so prune/delete can see the finalized row.
+
+    Asserts that ``_run_cleanup()`` — called by ``_finalize_single_query`` —
+    invokes ``_active_agent_ref._session_db.end_session(session_id, "shutdown")``
+    exactly once, and that this happens before the lease is released."""
+    calls = []
+    session_id = "one-shot-session"
+    session_db_calls = []
+
+    fake_session_db = SimpleNamespace(
+        end_session=lambda sid, reason: (
+            session_db_calls.append((sid, reason)),
+            calls.append("end_session"),
+        ),
+    )
+    fake_agent = SimpleNamespace(
+        session_id=session_id,
+        _session_db=fake_session_db,
+    )
+    # Wire through _active_agent_ref as the real setup path does
+    monkeypatch.setattr(cli, "_active_agent_ref", fake_agent)
+
+    fake_cli = SimpleNamespace(
+        _release_active_session=lambda: calls.append("release"),
+    )
+
+    # Stub notify so it doesn't touch cli.agent which our fake_cli lacks
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: calls.append("finalize")
+    )
+
+    # Stub _run_cleanup sub-operations that need real infrastructure.
+    # Do NOT mock _run_cleanup itself — we want the real path to execute
+    # so our fix (end_session via _active_agent_ref) runs.
+    monkeypatch.setattr(cli, "_arm_exit_watchdog", lambda **kw: None)
+    monkeypatch.setattr(cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_browsers", lambda: None)
+    monkeypatch.setattr(
+        tools.async_delegation, "interrupt_all", lambda reason: None,
+    )
+    monkeypatch.setattr(tools.mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(agent.auxiliary_client, "shutdown_cached_clients", lambda: None)
+
+    cli._finalize_single_query(fake_cli)
+
+    # end_session must be called exactly once with the shutdown reason
+    assert session_db_calls == [(session_id, "shutdown")]
+
+    # Session close must happen before the active-session lease is released.
+    # _finalize_single_query: _notify (finalize) → _run_cleanup (end_session) → release
+    finalize_idx = calls.index("finalize")
+    end_session_idx = calls.index("end_session")
+    release_idx = calls.index("release")
+    assert finalize_idx < end_session_idx < release_idx
+
+
+def test_finalize_single_query_end_session_uses_active_agent_ref(monkeypatch):
+    """One-shot exit accesses end_session through _active_agent_ref, which
+    the agent setup path publishes at cli_agent_setup_mixin.py:395-405."""
+    session_id = "ref-session"
+    end_session_calls = []
+
+    fake_session_db = SimpleNamespace(
+        end_session=lambda sid, reason: end_session_calls.append((sid, reason)),
+    )
+    fake_agent = SimpleNamespace(
+        session_id=session_id,
+        _session_db=fake_session_db,
+    )
+    monkeypatch.setattr(cli, "_active_agent_ref", fake_agent)
+
+    fake_cli = SimpleNamespace(
+        _release_active_session=lambda: None,
+    )
+
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: None
+    )
+    monkeypatch.setattr(cli, "_arm_exit_watchdog", lambda **kw: None)
+    monkeypatch.setattr(cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_browsers", lambda: None)
+    monkeypatch.setattr(
+        "tools.async_delegation", SimpleNamespace(interrupt_all=lambda reason: None)
+    )
+    monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr("agent.auxiliary_client.shutdown_cached_clients", lambda: None)
+
+    cli._finalize_single_query(fake_cli)
+
+    assert end_session_calls == [(session_id, "shutdown")]
+
+
 def test_notify_single_query_session_finalize_uses_agent_session(monkeypatch):
     calls = []
     fake_agent = SimpleNamespace(session_id="agent-session", platform="cli")
@@ -177,7 +277,7 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
             calls.append(("chat", query, images))
             return "done"
 
-        def _print_exit_summary(self):
+        def _print_exit_summary(self, clear_screen=True):
             calls.append("summary")
 
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
