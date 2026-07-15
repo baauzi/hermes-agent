@@ -187,42 +187,115 @@ def test_finalize_single_query_closes_session_db_before_releasing_lease(monkeypa
     assert finalize_idx < end_session_idx < release_idx
 
 
-def test_finalize_single_query_end_session_uses_active_agent_ref(monkeypatch):
-    """One-shot exit accesses end_session through _active_agent_ref, which
-    the agent setup path publishes at cli_agent_setup_mixin.py:395-405."""
-    session_id = "ref-session"
-    end_session_calls = []
+
+
+def test_run_cleanup_calls_end_session_directly(monkeypatch):
+    """atexit path: _run_cleanup() called directly (not via _finalize_single_query)
+    must still call end_session via _active_agent_ref."""
+    session_id = "atexit-session"
+    session_db_calls = []
 
     fake_session_db = SimpleNamespace(
-        end_session=lambda sid, reason: end_session_calls.append((sid, reason)),
+        end_session=lambda sid, reason: session_db_calls.append((sid, reason)),
     )
-    fake_agent = SimpleNamespace(
-        session_id=session_id,
-        _session_db=fake_session_db,
-    )
+    fake_agent = SimpleNamespace(session_id=session_id, _session_db=fake_session_db)
     monkeypatch.setattr(cli, "_active_agent_ref", fake_agent)
 
-    fake_cli = SimpleNamespace(
-        _release_active_session=lambda: None,
-    )
-
-    monkeypatch.setattr(
-        cli, "_notify_single_query_session_finalize", lambda _cli: None
-    )
+    # Stub sub-operations but let the real _run_cleanup execute
     monkeypatch.setattr(cli, "_arm_exit_watchdog", lambda **kw: None)
     monkeypatch.setattr(cli, "_reset_terminal_input_modes_on_exit", lambda: None)
     monkeypatch.setattr(cli, "_cleanup_all_terminals", lambda: None)
     monkeypatch.setattr(cli, "_cleanup_all_browsers", lambda: None)
     monkeypatch.setattr(
-        "tools.async_delegation", SimpleNamespace(interrupt_all=lambda reason: None)
+        tools.async_delegation, "interrupt_all", lambda reason: None,
     )
-    monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
-    monkeypatch.setattr("agent.auxiliary_client.shutdown_cached_clients", lambda: None)
+    monkeypatch.setattr(tools.mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(agent.auxiliary_client, "shutdown_cached_clients", lambda: None)
+    monkeypatch.setattr(cli, "_should_emit_cleanup_session_finalize", lambda _sid: False)
 
+    cli._run_cleanup()
+
+    assert session_db_calls == [(session_id, "shutdown")]
+
+
+def test_run_cleanup_skips_end_session_when_active_agent_ref_is_none(monkeypatch):
+    """When _active_agent_ref is None (e.g. early exit before agent init),
+    _run_cleanup must not crash."""
+    monkeypatch.setattr(cli, "_active_agent_ref", None)
+    monkeypatch.setattr(cli, "_arm_exit_watchdog", lambda **kw: None)
+    monkeypatch.setattr(cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_browsers", lambda: None)
+    monkeypatch.setattr(
+        tools.async_delegation, "interrupt_all", lambda reason: None,
+    )
+    monkeypatch.setattr(tools.mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(agent.auxiliary_client, "shutdown_cached_clients", lambda: None)
+    monkeypatch.setattr(cli, "_should_emit_cleanup_session_finalize", lambda _sid: False)
+
+    # Must not raise
+    cli._run_cleanup()
+
+
+def test_run_cleanup_skips_end_session_when_session_db_missing(monkeypatch):
+    """When _active_agent_ref has session_id but no _session_db attribute,
+    _run_cleanup must not crash."""
+    fake_agent = SimpleNamespace(session_id="no-db-session")
+    monkeypatch.setattr(cli, "_active_agent_ref", fake_agent)
+    monkeypatch.setattr(cli, "_arm_exit_watchdog", lambda **kw: None)
+    monkeypatch.setattr(cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_browsers", lambda: None)
+    monkeypatch.setattr(
+        tools.async_delegation, "interrupt_all", lambda reason: None,
+    )
+    monkeypatch.setattr(tools.mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(agent.auxiliary_client, "shutdown_cached_clients", lambda: None)
+    monkeypatch.setattr(cli, "_should_emit_cleanup_session_finalize", lambda _sid: False)
+
+    # Must not raise
+    cli._run_cleanup()
+
+
+def test_run_cleanup_end_session_called_once_across_double_invocation(monkeypatch):
+    """When _finalize_single_query triggers _run_cleanup and then atexit
+    fires _run_cleanup again, end_session must only be called once.
+    _cleanup_done prevents the second invocation."""
+    session_id = "double-session"
+    session_db_calls = []
+
+    fake_session_db = SimpleNamespace(
+        end_session=lambda sid, reason: session_db_calls.append((sid, reason)),
+    )
+    fake_agent = SimpleNamespace(session_id=session_id, _session_db=fake_session_db)
+    monkeypatch.setattr(cli, "_active_agent_ref", fake_agent)
+
+    monkeypatch.setattr(cli, "_arm_exit_watchdog", lambda **kw: None)
+    monkeypatch.setattr(cli, "_reset_terminal_input_modes_on_exit", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_terminals", lambda: None)
+    monkeypatch.setattr(cli, "_cleanup_all_browsers", lambda: None)
+    monkeypatch.setattr(
+        tools.async_delegation, "interrupt_all", lambda reason: None,
+    )
+    monkeypatch.setattr(tools.mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(agent.auxiliary_client, "shutdown_cached_clients", lambda: None)
+    monkeypatch.setattr(cli, "_should_emit_cleanup_session_finalize", lambda _sid: False)
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: None
+    )
+
+    # First invocation via _finalize_single_query
+    fake_cli = SimpleNamespace(_release_active_session=lambda: None)
     cli._finalize_single_query(fake_cli)
+    assert session_db_calls == [(session_id, "shutdown")]
 
-    assert end_session_calls == [(session_id, "shutdown")]
+    # Second invocation: atexit calls _run_cleanup directly.
+    # _cleanup_done is True from the first call, so _run_cleanup
+    # returns immediately without calling end_session again.
+    cli._run_cleanup()
 
+    # end_session must still have been called exactly once
+    assert session_db_calls == [(session_id, "shutdown")]
 
 def test_notify_single_query_session_finalize_uses_agent_session(monkeypatch):
     calls = []
